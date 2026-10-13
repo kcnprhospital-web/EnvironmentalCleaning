@@ -1,0 +1,165 @@
+/**
+ * KCPH Environmental Cleaning Monitoring — Google Apps Script backend
+ * Kampong Chhnang Provincial Hospital
+ * Based on CDC & ICAN (2019) Best Practices for Environmental Cleaning
+ * in Healthcare Facilities in Resource-Limited Settings.
+ *
+ * GET-only API (avoids CORS preflight):
+ *   ?action=ping
+ *   ?action=save&payload=<JSON record>
+ *   ?action=list&from=YYYY-MM-DD&to=YYYY-MM-DD
+ *   ?action=delete&id=<record id>&pin=<ADMIN_PIN>
+ *
+ * SETUP
+ *   1. Create a new Google Sheet → Extensions → Apps Script → paste this file.
+ *   2. Change ADMIN_PIN below.
+ *   3. Run setup() once and authorise.
+ *   4. Deploy → New deployment → Web app → Execute as: Me · Who has access: Anyone.
+ *   5. Paste the /exec URL into DEFAULT_API_URL in index.html (or Settings tab).
+ *   For later code changes: Deploy → Manage deployments → Edit → Version: New version
+ *   (keeps the same /exec URL).
+ */
+
+const ADMIN_PIN = '2026';            // ← CHANGE THIS before deploying
+const SHEET_RECORDS = 'Records';
+const SHEET_ITEMS = 'Items';
+const TZ = 'Asia/Phnom_Penh';
+
+const REC_HEADERS = ['ID', 'Submitted', 'Date', 'Time', 'Module', 'Ward', 'Area', 'CleanType', 'Method',
+  'Location', 'Auditor', 'Cleaner', 'Applicable', 'Compliant', 'Partial', 'Score', 'Feedback',
+  'CorrectiveAction', 'Comments', 'ItemsJSON'];
+const ITEM_HEADERS = ['ID', 'Date', 'Module', 'Ward', 'Area', 'CleanType', 'ItemCode', 'Result'];
+
+const MODULES = ['SURF', 'OBS', 'SUP'];
+const VALID_RESULTS = ['C', 'P', 'N', 'Y', 'NA'];
+
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  let out;
+  try {
+    switch (p.action) {
+      case 'ping':   out = { ok: true, time: new Date().toISOString(), records: countRows_(SHEET_RECORDS) }; break;
+      case 'save':   out = save_(p.payload); break;
+      case 'list':   out = list_(p.from, p.to); break;
+      case 'delete': out = delete_(p.id, p.pin); break;
+      default:       out = { ok: false, error: 'Unknown action' };
+    }
+  } catch (err) {
+    out = { ok: false, error: String(err && err.message || err) };
+  }
+  const json = JSON.stringify(out);
+  if (p.callback && /^[\w.$]+$/.test(p.callback)) {   // optional JSONP fallback
+    return ContentService.createTextOutput(p.callback + '(' + json + ')').setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Run once from the editor to create sheets and authorise. */
+function setup() {
+  sheet_(SHEET_RECORDS, REC_HEADERS);
+  sheet_(SHEET_ITEMS, ITEM_HEADERS);
+  return 'Ready';
+}
+
+function sheet_(name, headers) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#2B3990').setFontColor('#ffffff');
+    sh.setFrozenRows(1);
+    // keep Date/Time as plain text so they are not converted to Date objects
+    sh.getRange('B:D').setNumberFormat('@');
+    if (name === SHEET_ITEMS) sh.getRange('B:B').setNumberFormat('@');
+  }
+  return sh;
+}
+
+function countRows_(name) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  return sh ? Math.max(0, sh.getLastRow() - 1) : 0;
+}
+
+function str_(v, max) { return String(v == null ? '' : v).replace(/[\r\n]+/g, ' ').trim().slice(0, max || 200); }
+function safeCell_(v) { const s = String(v); return /^[=+\-@]/.test(s) ? "'" + s : s; }   // block formula injection
+
+function save_(payload) {
+  if (!payload) throw new Error('Missing payload');
+  const r = JSON.parse(payload);
+  if (!r.id || !/^EC[A-Z0-9]{5,20}$/.test(r.id)) throw new Error('Invalid id');
+  if (MODULES.indexOf(r.module) < 0) throw new Error('Invalid module');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date)) throw new Error('Invalid date');
+  if (!r.ward || !r.auditor) throw new Error('Ward and auditor are required');
+  const items = r.items || {};
+  const codes = Object.keys(items);
+  if (!codes.length || codes.length > 60) throw new Error('Invalid items');
+  let app = 0, ok = 0, partial = 0;
+  codes.forEach(function (c) {
+    if (!/^[a-z0-9]{1,20}$/.test(c) || VALID_RESULTS.indexOf(items[c]) < 0) throw new Error('Invalid item ' + c);
+    if (items[c] === 'NA') return;
+    app++; if (items[c] === 'C' || items[c] === 'Y') ok++; if (items[c] === 'P') partial++;
+  });
+  const score = app ? Math.round(ok / app * 1000) / 10 : '';   // recomputed server-side
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const rs = sheet_(SHEET_RECORDS, REC_HEADERS);
+    const is = sheet_(SHEET_ITEMS, ITEM_HEADERS);
+    // idempotent: offline queue may resend
+    if (rs.getLastRow() > 1) {
+      const found = rs.getRange(2, 1, rs.getLastRow() - 1, 1).createTextFinder(r.id).matchEntireCell(true).findNext();
+      if (found) return { ok: true, id: r.id, duplicate: true };
+    }
+    const row = [r.id, Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd HH:mm:ss'), r.date, str_(r.time, 5), r.module,
+      str_(r.ward, 20), str_(r.area, 20), str_(r.cleanType, 20), str_(r.method, 20), str_(r.location, 60),
+      str_(r.auditor, 60), str_(r.cleaner, 60), app, ok, partial, score, str_(r.feedback, 1),
+      str_(r.action, 500), str_(r.comments, 500), JSON.stringify(items)].map(function (v) { return typeof v === 'string' ? safeCell_(v) : v; });
+    rs.appendRow(row);
+    const itemRows = codes.map(function (c) { return [r.id, r.date, r.module, str_(r.ward, 20), str_(r.area, 20), str_(r.cleanType, 20), c, items[c]]; });
+    is.getRange(is.getLastRow() + 1, 1, itemRows.length, ITEM_HEADERS.length).setValues(itemRows);
+  } finally {
+    lock.releaseLock();
+  }
+  return { ok: true, id: r.id, score: score };
+}
+
+function list_(from, to) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_RECORDS);
+  if (!sh || sh.getLastRow() < 2) return { ok: true, records: [] };
+  const vals = sh.getRange(2, 1, sh.getLastRow() - 1, REC_HEADERS.length).getValues();
+  const out = [];
+  vals.forEach(function (v) {
+    const date = v[2] instanceof Date ? Utilities.formatDate(v[2], TZ, 'yyyy-MM-dd') : String(v[2]);
+    if (from && date < from) return;
+    if (to && date > to) return;
+    const time = v[3] instanceof Date ? Utilities.formatDate(v[3], TZ, 'HH:mm') : String(v[3]);
+    out.push({
+      id: String(v[0]), submitted: String(v[1]), date: date, time: time, module: String(v[4]), ward: String(v[5]),
+      area: String(v[6]), cleanType: String(v[7]), method: String(v[8]), location: unq_(v[9]), auditor: unq_(v[10]),
+      cleaner: unq_(v[11]), applicable: Number(v[12]) || 0, compliant: Number(v[13]) || 0, partial: Number(v[14]) || 0,
+      score: v[15] === '' ? null : Number(v[15]), feedback: String(v[16]), action: unq_(v[17]), comments: unq_(v[18]),
+      items: String(v[19] || '{}')
+    });
+  });
+  return { ok: true, records: out };
+}
+function unq_(v) { return String(v == null ? '' : v); }
+
+function delete_(id, pin) {
+  if (String(pin) !== ADMIN_PIN) throw new Error('Wrong PIN');
+  if (!id) throw new Error('Missing id');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    [SHEET_ITEMS, SHEET_RECORDS].forEach(function (name) {
+      const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+      if (!sh || sh.getLastRow() < 2) return;
+      const ids = sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues();
+      for (let i = ids.length - 1; i >= 0; i--) if (String(ids[i][0]) === String(id)) sh.deleteRow(i + 2);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+  return { ok: true };
+}
